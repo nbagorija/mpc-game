@@ -4,7 +4,7 @@ import json
 import random
 import time
 from config import FIELD_SIZE, PRIME
-from crypto_utils import generate_additive_shares, mod
+from crypto_utils import generate_additive_shares
 from network import RepeaterConnection
 
 
@@ -40,21 +40,31 @@ class Player:
         print(f"[{self.nickname}] Все игроки: {self.all_players}")
 
     def wait_for_message(self, msg_type, extra_check=None, timeout=300):
+        """Ожидание конкретного типа сообщения."""
         deadline = time.time() + timeout
 
-        # Проверяем очередь
+        # Сначала ищем в очереди
         new_queue = []
+        found = None
         for item in self.conn.message_queue:
+            if found is not None:
+                new_queue.append(item)
+                continue
             try:
                 data = json.loads(item)
                 if data.get("type") == msg_type:
                     if extra_check is None or extra_check(data):
-                        self.conn.message_queue = new_queue + self.conn.message_queue[self.conn.message_queue.index(item)+1:]
-                        return data
+                        found = data
+                        continue
             except json.JSONDecodeError:
                 pass
             new_queue.append(item)
 
+        if found is not None:
+            self.conn.message_queue = new_queue
+            return found
+
+        # Не нашли в очереди — читаем из сети
         while time.time() < deadline:
             remaining = max(1, deadline - time.time())
             raw = self.conn.recv_message(timeout=remaining)
@@ -65,12 +75,14 @@ class Player:
                 if data.get("type") == msg_type:
                     if extra_check is None or extra_check(data):
                         return data
+                # Не подошло — обратно в очередь
                 self.conn.message_queue.append(raw)
             except json.JSONDecodeError:
                 pass
         return None
 
     def collect_messages(self, msg_type, count, extra_check=None, timeout=300):
+        """Собрать count сообщений определённого типа."""
         results = []
         deadline = time.time() + timeout
         while len(results) < count and time.time() < deadline:
@@ -81,6 +93,7 @@ class Player:
         return results
 
     def sync_barrier(self, barrier_name):
+        """Синхронизация между всеми игроками."""
         print(f"[{self.nickname}] Барьер '{barrier_name}' — отправляю...")
         msg = json.dumps({
             "type": "barrier",
@@ -101,11 +114,16 @@ class Player:
         print(f"[{self.nickname}] Барьер '{barrier_name}' ОК")
 
     def generate_secret_point(self):
-        my_x = random.randint(0, PRIME - 1)
-        my_y = random.randint(0, PRIME - 1)
+        """
+        Каждый игрок генерирует случайные координаты и раздаёт шеры.
+        Итоговая точка Q = сумма всех вкладов по модулю field_size.
+        Координаты Q: 0..field_size-1 (внутренние), 1..field_size (для пользователя).
+        """
+        my_x = random.randint(0, self.field_size - 1)
+        my_y = random.randint(0, self.field_size - 1)
 
-        shares_x = generate_additive_shares(my_x, self.num_parties)
-        shares_y = generate_additive_shares(my_y, self.num_parties)
+        shares_x = generate_additive_shares(my_x, self.num_parties, p=self.field_size)
+        shares_y = generate_additive_shares(my_y, self.num_parties, p=self.field_size)
 
         for i, player in enumerate(self.all_players):
             if player == self.nickname:
@@ -128,17 +146,26 @@ class Player:
             self.shares_y[sender] = data["share_y"]
             print(f"[{self.nickname}] Получена доля от {sender}")
 
-        self.my_total_share_x = mod(sum(self.shares_x.values()))
-        self.my_total_share_y = mod(sum(self.shares_y.values()))
+        self.my_total_share_x = sum(self.shares_x.values()) % self.field_size
+        self.my_total_share_y = sum(self.shares_y.values()) % self.field_size
         print(f"[{self.nickname}] Точка Q сгенерирована")
 
     def check_guess(self, guesser, guess_x=None, guess_y=None):
+        """
+        Проверить угадывание через MPC.
+        guess_x, guess_y — координаты 1..field_size (пользовательские).
+        Внутри переводим в 0..field_size-1.
+        """
         is_me = (guesser == self.nickname)
 
         if is_me:
+            # Пользователь вводит 1..n, внутри храним 0..n-1
+            internal_x = guess_x - 1
+            internal_y = guess_y - 1
             print(f"[{self.nickname}] Угадываю: ({guess_x}, {guess_y})")
-            shares_gx = generate_additive_shares(guess_x, self.num_parties)
-            shares_gy = generate_additive_shares(guess_y, self.num_parties)
+
+            shares_gx = generate_additive_shares(internal_x, self.num_parties, p=self.field_size)
+            shares_gy = generate_additive_shares(internal_y, self.num_parties, p=self.field_size)
             my_share_gx = shares_gx[self.my_index]
             my_share_gy = shares_gy[self.my_index]
 
@@ -160,9 +187,11 @@ class Player:
             my_share_gx = data["share_gx"]
             my_share_gy = data["share_gy"]
 
-        d_x_share = mod(self.my_total_share_x - my_share_gx)
-        d_y_share = mod(self.my_total_share_y - my_share_gy)
+        # Вычисляем долю разности
+        d_x_share = (self.my_total_share_x - my_share_gx) % self.field_size
+        d_y_share = (self.my_total_share_y - my_share_gy) % self.field_size
 
+        # Отправляем свою долю разности всем
         msg = json.dumps({
             "type": "diff_share",
             "from": self.nickname,
@@ -172,6 +201,7 @@ class Player:
         })
         self.conn.send_to(self.peers, msg)
 
+        # Собираем доли от всех
         all_dx = {self.nickname: d_x_share}
         all_dy = {self.nickname: d_y_share}
 
@@ -184,8 +214,10 @@ class Player:
             all_dx[data["from"]] = data["d_x"]
             all_dy[data["from"]] = data["d_y"]
 
-        total_dx = mod(sum(all_dx.values()))
-        total_dy = mod(sum(all_dy.values()))
+        # Восстанавливаем разность
+        total_dx = sum(all_dx.values()) % self.field_size
+        total_dy = sum(all_dy.values()) % self.field_size
+
         guessed = (total_dx == 0 and total_dy == 0)
 
         if guessed:
@@ -195,6 +227,7 @@ class Player:
         return guessed
 
     def play(self, expected_players):
+        """Основной игровой процесс."""
         self.connect_and_wait(expected_players)
 
         print(f"[{self.nickname}] Жду 3 сек перед стартом...")
@@ -221,7 +254,10 @@ class Player:
                     guess_x = int(input(f"x (1-{self.field_size}): "))
                     guess_y = int(input(f"y (1-{self.field_size}): "))
 
-                    msg = json.dumps({"type": "start_check", "guesser": self.nickname})
+                    msg = json.dumps({
+                        "type": "start_check",
+                        "guesser": self.nickname
+                    })
                     self.conn.send_to(self.peers, msg)
                     time.sleep(0.5)
                     guessed = self.check_guess(self.nickname, guess_x, guess_y)
@@ -239,5 +275,7 @@ class Player:
                     winner = player
                     break
 
-        print(f"\n🏆 ПОБЕДИТЕЛЬ: {winner}!")
+        print(f"\n{'='*50}")
+        print(f"🏆 ПОБЕДИТЕЛЬ: {winner}!")
+        print(f"{'='*50}")
         self.conn.close()

@@ -2,7 +2,6 @@
 
 import socket
 import time
-import json
 from config import SERVER_HOST, SERVER_PORT
 
 
@@ -27,24 +26,21 @@ class RepeaterConnection:
         print(f"[NET] Ответ сервера:\n{data}")
 
     def send_to(self, recipients, data):
-        """Отправить JSON-данные получателям. Добавляем маркер конца ||"""
+        """Отправить данные получателям с маркером || для разделения."""
         if isinstance(recipients, list):
             recipients = ",".join(recipients)
         data_clean = data.strip()
-        # Добавляем маркер || чтобы получатель мог разделить сообщения
         msg = f"send {recipients} {data_clean}||\n"
         self.sock.sendall(msg.encode())
 
     def recv_message(self, timeout=60):
         """Получить одно JSON-сообщение, разделённое маркером ||"""
-        # Сначала проверяем очередь
         if self.message_queue:
             return self.message_queue.pop(0)
 
         deadline = time.time() + timeout
 
         while time.time() < deadline:
-            # Ищем маркер || в буфере
             self._extract_messages()
             if self.message_queue:
                 return self.message_queue.pop(0)
@@ -59,7 +55,6 @@ class RepeaterConnection:
             except socket.timeout:
                 break
 
-        # Последняя попытка
         self._extract_messages()
         if self.message_queue:
             return self.message_queue.pop(0)
@@ -75,7 +70,6 @@ class RepeaterConnection:
 
             if raw.startswith("{"):
                 self.message_queue.append(raw)
-            # Иначе — серверное сообщение, игнорируем
 
     def get_peers_once(self):
         """Один запрос списка подключённых."""
@@ -88,7 +82,6 @@ class RepeaterConnection:
             line = line.strip()
             if not line:
                 continue
-            # JSON-сообщения сохраняем
             if "||" in line:
                 parts = line.split("||")
                 for part in parts:
