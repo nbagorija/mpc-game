@@ -39,26 +39,42 @@ class Player:
         print(f"[{self.nickname}] Все игроки: {self.all_players}")
         print(f"[{self.nickname}] Мой индекс: {self.my_index}")
 
+    def wait_for_message(self, msg_type, extra_check=None, timeout=120):
+        """Универсальный метод ожидания конкретного типа сообщения."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            raw = self.conn.recv_message(timeout=remaining)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+                if data.get("type") == msg_type:
+                    if extra_check is None or extra_check(data):
+                        return data
+                # Не тот тип — вернуть в очередь
+                self.conn.message_queue.append(raw)
+            except json.JSONDecodeError:
+                pass
+        return None
+
     def sync_barrier(self, barrier_name):
-        """Простая синхронизация: все отправляют ready и ждут от всех."""
+        """Синхронизация: все отправляют ready и ждут от всех."""
         msg = json.dumps({
             "type": "barrier",
             "name": barrier_name,
             "from": self.nickname
         })
         self.conn.send_to(self.peers, msg)
-        
+
         received = set()
         while len(received) < len(self.peers):
-            raw = self.conn.recv_message(timeout=120)
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-                if data.get("type") == "barrier" and data.get("name") == barrier_name:
-                    received.add(data["from"])
-            except json.JSONDecodeError:
-                pass
+            data = self.wait_for_message(
+                "barrier",
+                extra_check=lambda d: d.get("name") == barrier_name
+            )
+            if data:
+                received.add(data["from"])
         print(f"[{self.nickname}] Синхронизация '{barrier_name}' завершена")
 
     def generate_secret_point(self):
@@ -83,23 +99,16 @@ class Player:
 
         received = 0
         while received < self.num_parties - 1:
-            raw = self.conn.recv_message(timeout=120)
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-                if data.get("type") == "share":
-                    sender = data["from"]
-                    self.shares_x[sender] = data["share_x"]
-                    self.shares_y[sender] = data["share_y"]
-                    received += 1
-                    print(f"[{self.nickname}] Получена доля от {sender}")
-            except json.JSONDecodeError:
-                print(f"[{self.nickname}] Ошибка парсинга: {raw}")
+            data = self.wait_for_message("share")
+            if data:
+                sender = data["from"]
+                self.shares_x[sender] = data["share_x"]
+                self.shares_y[sender] = data["share_y"]
+                received += 1
+                print(f"[{self.nickname}] Получена доля от {sender}")
 
         self.my_total_share_x = mod(sum(self.shares_x.values()))
         self.my_total_share_y = mod(sum(self.shares_y.values()))
-
         print(f"[{self.nickname}] Секретная точка Q сгенерирована")
 
     def check_guess(self, guesser, guess_x=None, guess_y=None):
@@ -124,21 +133,14 @@ class Player:
                     })
                     self.conn.send_to(player, msg)
         else:
-            my_share_gx = None
-            my_share_gy = None
-            while my_share_gx is None:
-                raw = self.conn.recv_message(timeout=120)
-                if not raw:
-                    continue
-                try:
-                    data = json.loads(raw)
-                    if data.get("type") == "guess_share" and data.get("guesser") == guesser:
-                        my_share_gx = data["share_gx"]
-                        my_share_gy = data["share_gy"]
-                except json.JSONDecodeError:
-                    pass
+            data = self.wait_for_message(
+                "guess_share",
+                extra_check=lambda d: d.get("guesser") == guesser
+            )
+            my_share_gx = data["share_gx"]
+            my_share_gy = data["share_gy"]
 
-        time.sleep(1)  # Небольшая пауза для синхронизации
+        time.sleep(0.5)
 
         d_x_share = mod(self.my_total_share_x - my_share_gx)
         d_y_share = mod(self.my_total_share_y - my_share_gy)
@@ -156,17 +158,14 @@ class Player:
         all_dy = {self.nickname: d_y_share}
 
         while len(all_dx) < self.num_parties:
-            raw = self.conn.recv_message(timeout=120)
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-                if data.get("type") == "diff_share" and data.get("guesser") == guesser:
-                    sender = data["from"]
-                    all_dx[sender] = data["d_x"]
-                    all_dy[sender] = data["d_y"]
-            except json.JSONDecodeError:
-                pass
+            data = self.wait_for_message(
+                "diff_share",
+                extra_check=lambda d: d.get("guesser") == guesser
+            )
+            if data:
+                sender = data["from"]
+                all_dx[sender] = data["d_x"]
+                all_dy[sender] = data["d_y"]
 
         total_dx = mod(sum(all_dx.values()))
         total_dy = mod(sum(all_dy.values()))
@@ -183,6 +182,9 @@ class Player:
     def play(self, expected_players):
         self.connect_and_wait(expected_players)
 
+        # Пауза чтобы все точно подключились
+        time.sleep(2)
+
         # Синхронизация
         self.sync_barrier("game_start")
 
@@ -191,8 +193,6 @@ class Player:
         print(f"{'='*50}\n")
 
         self.generate_secret_point()
-
-        # Синхронизация после генерации точки
         self.sync_barrier("point_generated")
 
         round_num = 0
@@ -212,25 +212,17 @@ class Player:
                         "guesser": self.nickname
                     })
                     self.conn.send_to(self.peers, msg)
-                    time.sleep(1)
+                    time.sleep(0.5)
 
                     guessed = self.check_guess(self.nickname, guess_x, guess_y)
                 else:
                     print(f"[{self.nickname}] Ожидаю ход {player}...")
-                    while True:
-                        raw = self.conn.recv_message(timeout=300)
-                        if not raw:
-                            continue
-                        try:
-                            data = json.loads(raw)
-                            if data.get("type") == "start_check" and data.get("guesser") == player:
-                                break
-                        except json.JSONDecodeError:
-                            pass
-
+                    self.wait_for_message(
+                        "start_check",
+                        extra_check=lambda d: d.get("guesser") == player
+                    )
                     guessed = self.check_guess(player)
 
-                # Синхронизация после каждого раунда
                 self.sync_barrier(f"round_{round_num}")
 
                 if guessed:
