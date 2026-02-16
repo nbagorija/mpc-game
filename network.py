@@ -14,6 +14,7 @@ class RepeaterConnection:
         self.nickname = nickname
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.buffer = ""
+        self.message_queue = []  # Очередь полученных JSON-сообщений
 
     def connect(self):
         """Подключиться к ретранслятору и зарегистрировать никнейм."""
@@ -37,33 +38,50 @@ class RepeaterConnection:
         """
         Отправить данные указанным получателям.
         recipients: список никнеймов или строка с никнеймами через запятую
-        data: строка данных
+        data: строка данных (должна заканчиваться на \n)
         """
         if isinstance(recipients, list):
             recipients = ",".join(recipients)
-        msg = f"send {recipients} {data}\n"
+        # Убираем лишние \n из data, чтобы не ломать протокол
+        data_clean = data.strip()
+        msg = f"send {recipients} {data_clean}\n"
         self.sock.sendall(msg.encode())
-        print(f"[NET] Отправлено -> {recipients}: {data.strip()}")
 
     def get_peers(self):
         """Получить список подключённых участников."""
         self.sock.sendall(b"print\n")
-        time.sleep(0.5)
+        time.sleep(1)
         data = self._recv_all_available()
         lines = data.strip().split("\n")
         peers = []
         for line in lines:
             line = line.strip()
             if line and "available connections" not in line:
-                peers.append(line)
+                # Проверяем, не JSON ли это (входящее сообщение)
+                if line.startswith("{"):
+                    self.message_queue.append(line)
+                else:
+                    peers.append(line)
         return peers
 
     def recv_message(self, timeout=60):
         """
-        Получить одно сообщение (строку, заканчивающуюся \n).
+        Получить одно JSON-сообщение.
+        Фильтрует серверные ответы.
         """
+        # Сначала проверяем очередь
+        if self.message_queue:
+            return self.message_queue.pop(0)
+
         self.sock.settimeout(timeout)
-        while "\n" not in self.buffer:
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self.sock.settimeout(remaining)
+
             try:
                 chunk = self.sock.recv(4096).decode()
                 if not chunk:
@@ -72,14 +90,29 @@ class RepeaterConnection:
             except socket.timeout:
                 break
 
-        if "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            return line.strip()
-        
-        # Если нет \n, вернём всё что есть
-        result = self.buffer.strip()
-        self.buffer = ""
-        return result
+            # Разбираем буфер построчно
+            while "\n" in self.buffer:
+                line, self.buffer = self.buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                # JSON-сообщения от других игроков начинаются с {
+                if line.startswith("{"):
+                    self.message_queue.append(line)
+                else:
+                    # Серверные сообщения — игнорируем или логируем
+                    print(f"[NET] Сервер: {line}")
+
+            # Если в очереди есть сообщение — возвращаем
+            if self.message_queue:
+                return self.message_queue.pop(0)
+
+        # Последняя проверка очереди
+        if self.message_queue:
+            return self.message_queue.pop(0)
+
+        return None
 
     def recv_messages(self, expected_count, timeout=60):
         """Получить expected_count сообщений."""
