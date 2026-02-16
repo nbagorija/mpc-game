@@ -2,6 +2,7 @@
 
 import socket
 import time
+import json
 from config import SERVER_HOST, SERVER_PORT
 
 
@@ -26,27 +27,27 @@ class RepeaterConnection:
         print(f"[NET] Ответ сервера:\n{data}")
 
     def send_to(self, recipients, data):
+        """Отправить JSON-данные получателям. Добавляем маркер конца ||"""
         if isinstance(recipients, list):
             recipients = ",".join(recipients)
         data_clean = data.strip()
-        msg = f"send {recipients} {data_clean}\n"
+        # Добавляем маркер || чтобы получатель мог разделить сообщения
+        msg = f"send {recipients} {data_clean}||\n"
         self.sock.sendall(msg.encode())
 
     def recv_message(self, timeout=60):
-        """Получить одну строку из сети."""
+        """Получить одно JSON-сообщение, разделённое маркером ||"""
+        # Сначала проверяем очередь
         if self.message_queue:
             return self.message_queue.pop(0)
 
-        self.sock.settimeout(timeout)
         deadline = time.time() + timeout
 
         while time.time() < deadline:
-            # Проверяем буфер
-            while "\n" in self.buffer:
-                line, self.buffer = self.buffer.split("\n", 1)
-                line = line.strip()
-                if line:
-                    return line
+            # Ищем маркер || в буфере
+            self._extract_messages()
+            if self.message_queue:
+                return self.message_queue.pop(0)
 
             remaining = max(0.1, deadline - time.time())
             self.sock.settimeout(remaining)
@@ -58,14 +59,47 @@ class RepeaterConnection:
             except socket.timeout:
                 break
 
-        # Последняя проверка буфера
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            line = line.strip()
-            if line:
-                return line
+        # Последняя попытка
+        self._extract_messages()
+        if self.message_queue:
+            return self.message_queue.pop(0)
 
         return None
+
+    def _extract_messages(self):
+        """Извлечь все JSON-сообщения из буфера по маркеру ||"""
+        while "||" in self.buffer:
+            idx = self.buffer.index("||")
+            raw = self.buffer[:idx].strip()
+            self.buffer = self.buffer[idx + 2:]
+
+            if raw.startswith("{"):
+                self.message_queue.append(raw)
+            # Иначе — серверное сообщение, игнорируем
+
+    def get_peers_once(self):
+        """Один запрос списка подключённых."""
+        self.sock.sendall(b"print\n")
+        time.sleep(1.5)
+        raw = self._recv_all_available()
+
+        peers = []
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # JSON-сообщения сохраняем
+            if "||" in line:
+                parts = line.split("||")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("{"):
+                        self.message_queue.append(part)
+            elif line.startswith("{"):
+                self.message_queue.append(line)
+            elif "available connections" not in line:
+                peers.append(line)
+        return peers
 
     def _recv_until(self, marker):
         while marker not in self.buffer:
